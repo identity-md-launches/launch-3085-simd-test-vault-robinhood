@@ -1,0 +1,78 @@
+{
+  "endpoint": "https://api.imd.fun/requests/check",
+  "date": "2026-11-06",
+  "scope": "Question wording screen; the check endpoint accepts question/panelSize/evidence, not the full on-chain oracle body. It supplies default chain/window/quorum in its response; these defaults do not replace the contract body. Addresses in this check are local test fixtures, not deployment addresses.",
+  "input": {
+    "question": "What is the bytes32 OpenZeppelin StandardMerkleTree root of the IMD claim allocations for SIMD TEST 2 holder rewards contract 0x87d962fe39ad936add2f853c739b8a8cce2b1bbd, epoch 1, using token 0x03a6a84cd762d9707a21605b548aaab891562aab balances at the end of the window block and the allocation, exclusions, holders, leaves and tree definitions?",
+    "panelSize": 30,
+    "evidence": "chain"
+  },
+  "response": {
+    "action": "oracle.request",
+    "request": {
+      "v": 1,
+      "question": "What is the bytes32 OpenZeppelin StandardMerkleTree root of the IMD claim allocations for SIMD TEST 2 holder rewards contract 0x87d962fe39ad936add2f853c739b8a8cce2b1bbd, epoch 1, using token 0x03a6a84cd762d9707a21605b548aaab891562aab balances at the end of the window block and the allocation, exclusions, holders, leaves and tree definitions?",
+      "chainId": 1,
+      "window": {
+        "hours": 24
+      },
+      "answerType": "bytes32",
+      "evidence": "chain",
+      "panelSize": 30,
+      "quorum": 21,
+      "validForSeconds": 86400
+    },
+    "proposed": {
+      "answerType": {
+        "value": "bytes32",
+        "confidence": 0.88
+      },
+      "evidence": {
+        "value": "chain",
+        "confidence": 0.96
+      },
+      "toleranceBps": {
+        "value": 0,
+        "confidence": 0.89
+      },
+      "head": {
+        "value": 1,
+        "confidence": 1
+      }
+    },
+    "judged": true,
+    "blockers": [],
+    "suggestions": [],
+    "online": 909,
+    "limits": {
+      "minPanelSize": 5,
+      "maxPanelSize": 100
+    },
+    "chains": [
+      {
+        "id": 1,
+        "name": "Ethereum mainnet"
+      },
+      {
+        "id": 56,
+        "name": "BNB Chain"
+      },
+      {
+        "id": 4663,
+        "name": "Robinhood Chain"
+      },
+      {
+        "id": 8453,
+        "name": "Base"
+      },
+      {
+        "id": 42161,
+        "name": "Arbitrum One"
+      },
+      {
+        "id": 11155111,
+        "name": "Sepolia"
+      }
+    ]
+  }
+}
