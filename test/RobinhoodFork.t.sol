@@ -23,13 +23,16 @@ interface ILiveHookFactory is IHookFactory {
     function setRequester(uint64 launchNumber, address next) external;
 }
 
-/// @notice Run with forge test --match-contract RobinhoodForkTest --fork-url <Robinhood RPC>
-/// Add --fork-block-number when using an archive endpoint. No environment reads or network in the offline run.
-/// @dev The HOOK factory's newest launch is 3076, the previous test launch, which this suite's
-/// contracts refuse by design. The flows after binding therefore use position 3077 answered by
+/// @notice Fork tests against Robinhood Chain's live state at the block pinned for this job.
+/// The RPC address (URL or socket path) is read from ROBINHOOD_RPC_URL; with no value every test skips.
+/// @dev The HOOK factory's newest launch at the pinned block is 3076, the previous test launch, which this
+/// suite's contracts refuse by design. The flows after binding therefore use position 3077 answered by
 /// vm.mockCall with the real 3076 pool key and this vault as requester; the real factory, Intake,
 /// IMD and pool token stay in place and the real factory's claimFees is exercised directly.
+/// Robinhood is an Arbitrum Orbit chain: forge answers ArbSys.arbBlockNumber() with block.number, so the
+/// L2 height is set with vm.roll and ArbSys is never mocked.
 contract RobinhoodForkTest is Test {
+    uint256 constant FORK_BLOCK = 107929117;
     uint64 constant EXISTING_LAUNCH = 3076;
     uint64 constant NEXT_LAUNCH = 3077;
     SIMDVault vault;
@@ -40,20 +43,25 @@ contract RobinhoodForkTest is Test {
     PoolKey existingKey;
 
     function setUp() public {
-        if (block.chainid != 4663 || Network.INTAKE.code.length == 0 || Network.FACTORY.code.length == 0) {
+        string memory url = vm.envOr("ROBINHOOD_RPC_URL", string(""));
+        if (bytes(url).length == 0) {
             vm.skip(true);
             return;
         }
+        vm.createSelectFork(url, FORK_BLOCK);
+        // Keep block.number and ArbSys.arbBlockNumber() on the fork's L2 height.
+        vm.roll(FORK_BLOCK);
+        assertEq(block.chainid, 4663, "not Robinhood Chain");
         vault = new SIMDVault();
-        // Set the harness block explicitly to the fork's L2 height. Do not etch/mock ArbSys.
-        vm.roll(vault.holderRewards().snapshotHead());
         (existingKey,,,) = factory.positionOf(EXISTING_LAUNCH);
         poolToken = existingKey.currency0 == Network.IMD ? existingKey.currency1 : existingKey.currency0;
     }
 
     function testFork_fixedContractsAreRealAndABICompatible() public {
-        emit log_named_uint("Robinhood fork block", block.number);
-        assertEq(vault.holderRewards().snapshotHead(), block.number);
+        assertEq(block.number, FORK_BLOCK);
+        assertEq(vault.holderRewards().snapshotHead(), FORK_BLOCK);
+        assertGt(Network.INTAKE.code.length, 0);
+        assertGt(Network.FACTORY.code.length, 0);
         assertEq(block.chainid, 4663);
         assertEq(IERC20Metadata(Network.IMD).symbol(), "IMD");
         assertEq(IERC20Metadata(Network.IMD).decimals(), 18);
@@ -108,8 +116,12 @@ contract RobinhoodForkTest is Test {
         (,,, address requester) = factory.positionOf(EXISTING_LAUNCH);
         uint256 before = imd.balanceOf(requester);
         // Prove the real claimFees ABI and that anyone may call it; it pays the requester, not the caller.
+        // It must also fit the gas the vault forwards, or distribute() would never collect fees.
         vm.prank(makeAddr("anyone"));
-        factory.claimFees(EXISTING_LAUNCH);
+        (bool ok,) = address(factory).call{gas: vault.CLAIM_FEES_GAS()}(
+            abi.encodeCall(IHookFactory.claimFees, (EXISTING_LAUNCH))
+        );
+        assertTrue(ok, "real claimFees does not fit the vault's gas budget");
         assertGe(imd.balanceOf(requester), before);
     }
 
