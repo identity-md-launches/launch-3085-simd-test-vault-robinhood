@@ -18,7 +18,9 @@ contract HolderRewardsTest is BaseTest {
         vm.roll(12345);
         uint256 id = _deposit(100 ether);
         HolderRewards.Epoch memory e = rewards.epoch(id);
-        assertEq(e.snapshotBlock, 12345);
+        // The window closes SNAPSHOT_DEPTH blocks behind the asking block: deep enough for the plane.
+        assertEq(rewards.SNAPSHOT_DEPTH(), 8);
+        assertEq(e.snapshotBlock, 12345 - 8);
         assertEq(e.pot, 99.5 ether);
         assertEq(rewards.reserved(), 99.5 ether);
         MockIntake.Request memory r = intake.getRequest(e.requestId);
@@ -30,8 +32,15 @@ contract HolderRewardsTest is BaseTest {
         assertEq(r.bodyHash, keccak256(encodedBody));
         assertEq(r.amount, PRICE);
         string memory body = string(encodedBody);
-        assertEq(vm.parseJsonUint(body, ".window.fromBlock"), 12345);
-        assertEq(vm.parseJsonUint(body, ".window.toBlock"), 12345);
+        assertEq(vm.parseJsonUint(body, ".window.fromBlock"), 12345 - 8);
+        assertEq(vm.parseJsonUint(body, ".window.toBlock"), 12345 - 8);
+        assertLe(vm.parseJsonUint(body, ".window.toBlock") + 5, rewards.snapshotHead());
+        // Stakes held by the jobs vault are credited to their stakers, so staking costs no rewards.
+        assertTrue(
+            vm.contains(
+                vm.parseJsonString(body, ".definitions.holders"), vm.toLowercase(vm.toString(address(jobs)))
+            )
+        );
         assertEq(vm.parseJsonUint(body, ".chainId"), 4663);
         assertEq(vm.parseJsonString(body, ".answerType"), "bytes32");
         assertEq(vm.parseJsonUint(body, ".panelSize"), 30);
@@ -91,7 +100,55 @@ contract HolderRewardsTest is BaseTest {
         rewards.retryOracle(id);
         assertEq(rewards.epoch(id).pot, 9.5 ether);
         assertEq(intake.nonce(), 1);
-        assertEq(rewards.epoch(id).snapshotBlock, 10_000);
+        assertEq(rewards.epoch(id).snapshotBlock, 10_000 - 8);
+    }
+
+    function test_failedRetryKeepsThePendingRequestAndItsAnswerIsStillAccepted() public {
+        uint256 id = _deposit(10 ether);
+        HolderRewards.Epoch memory before = rewards.epoch(id);
+        OracleAttestation.Attestation memory a = _attestation(id, _leaf(alice, 9.5 ether));
+        bytes memory sig = _signature(a);
+        vm.warp(block.timestamp + 1 days);
+        intake.setFailure(false, true);
+        vm.prank(bob);
+        rewards.retryOracle(id);
+        HolderRewards.Epoch memory after_ = rewards.epoch(id);
+        assertEq(after_.requestId, before.requestId, "pending request dropped by a failed retry");
+        assertEq(after_.questionHash, before.questionHash);
+        assertEq(after_.pot, before.pot);
+        assertEq(after_.askedAt, before.askedAt);
+        assertEq(rewards.requestEpoch(before.requestId), id);
+        assertEq(rewards.reserved(), 9.5 ether);
+        // The honest answer to the still-live request, issued before the failed retry, is accepted.
+        vm.prank(Network.INTAKE);
+        rewards.onOracleResult(before.requestId, a, sig);
+        assertEq(rewards.epoch(id).root, _leaf(alice, 9.5 ether));
+        vm.prank(alice);
+        rewards.claim(id, 9.5 ether, new bytes32[](0));
+        assertEq(imd.balanceOf(alice), 9.5 ether);
+    }
+
+    function test_retryAtPriceBoundaryKeepsTheLastBoughtRequest() public {
+        // 1.4 IMD: pot 0.9 after the first ask; retry -> pot 0.4; price 0.5 >= 0.4 blocks a third ask.
+        uint256 start = block.timestamp;
+        uint256 id = _deposit(1.4 ether);
+        vm.warp(start + 1 days);
+        rewards.retryOracle(id);
+        bytes32 requestB = rewards.epoch(id).requestId;
+        assertEq(rewards.epoch(id).pot, 0.4 ether);
+        vm.warp(start + 2 days);
+        vm.prank(bob);
+        rewards.retryOracle(id);
+        assertEq(rewards.epoch(id).requestId, requestB, "request B dropped although nothing replaced it");
+        assertEq(rewards.requestEpoch(requestB), id);
+        assertEq(intake.nonce(), 2);
+        _answer(id, _leaf(alice, 0.4 ether));
+        vm.prank(alice);
+        rewards.claim(id, 0.4 ether, new bytes32[](0));
+        // The epoch keeps its request, so the next deposit does not carry its pot elsewhere.
+        uint256 next = _deposit(10 ether);
+        assertEq(rewards.epoch(next).pot, 9.5 ether);
+        assertFalse(rewards.epoch(id).closed);
     }
 
     function test_unansweredOracleRetriesFromItsOwnPotAndInvalidatesOldId() public {
@@ -317,7 +374,7 @@ contract HolderRewardsTest is BaseTest {
         uint256 next = rewards.currentEpoch();
         assertEq(next, id + 1);
         assertEq(rewards.epoch(next).pot, pot);
-        assertEq(rewards.epoch(next).snapshotBlock, block.number);
+        assertEq(rewards.epoch(next).snapshotBlock, vm.getBlockNumber() - 8);
         assertEq(rewards.reserved(), pot);
         vm.prank(alice);
         rewards.retryOracle(next);

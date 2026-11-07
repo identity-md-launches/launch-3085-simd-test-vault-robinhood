@@ -23,6 +23,9 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
     uint16 public constant QUORUM = 20;
     uint256 public constant ANSWER_VALIDITY = 1 days;
     uint256 public constant REQUEST_GAS = 2_000_000;
+    /// @notice L2 blocks between the deposit transaction and the snapshot it pins. The oracle plane
+    /// refuses an absolute window whose last block is fewer than five deep when it reads the ask.
+    uint256 public constant SNAPSHOT_DEPTH = 8;
 
     struct Epoch {
         // Net IMD reserved, after oracle fees and any unallocated carry moved to a newer epoch.
@@ -34,7 +37,10 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
         uint256 unallocated;
         uint256 openedAt;
         uint256 snapshotBlock;
+        // Time of the last attempt, paid or not: the retry delay counts from here.
         uint256 lastAttempt;
+        // Time of the last paid request: an answer must have been issued after it.
+        uint256 askedAt;
         bytes32 requestId;
         bytes32 questionHash;
         bytes32 root;
@@ -127,15 +133,13 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
     }
 
     /// @notice Retry a reverted/lost/refused request after one day, or first ask for a rollover epoch.
-    /// @dev Each successful ask spends another live price from this epoch alone. Old ids are invalidated.
+    /// @dev Each successful ask spends another live price from this epoch alone and invalidates the
+    /// previous id. A retry whose replacement request fails changes nothing: the pending request, if
+    /// any, stays the epoch's request and its answer is still accepted.
     function retryOracle(uint256 id) external nonReentrant {
         Epoch storage e = _liveEpoch(id);
         if (e.root != bytes32(0)) revert AlreadyAnswered();
         if (e.attempted && block.timestamp < e.lastAttempt + RETRY_DELAY) revert TooSoon();
-        if (e.requestId != bytes32(0)) {
-            delete requestEpoch[e.requestId];
-            e.requestId = bytes32(0);
-        }
         _attempt(id);
     }
 
@@ -175,8 +179,13 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
             );
         IERC20(Network.IMD).forceApprove(Network.INTAKE, 0);
         if (requestId == bytes32(0) || requestEpoch[requestId] != 0) revert CannotRequest();
+        // Only a request that has been bought replaces the previous one. A revert anywhere above
+        // leaves the previous id live, so a failed retry never discards a pending ask.
+        bytes32 previous = e.requestId;
+        if (previous != bytes32(0)) delete requestEpoch[previous];
         e.requestId = requestId;
         e.questionHash = questionHash;
+        e.askedAt = block.timestamp;
         requestEpoch[requestId] = id;
         emit OracleRequested(id, requestId, questionHash, price);
     }
@@ -195,7 +204,7 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
         if (
             a.chainId != block.chainid || a.fromBlock != e.snapshotBlock || a.toBlock != e.snapshotBlock
                 || a.panelSize < PANEL_SIZE || a.quorum < QUORUM || a.agreed < a.quorum
-                || a.agreed > a.panelSize || uint256(a.issuedAt) + ISSUED_AT_TOLERANCE < e.lastAttempt
+                || a.agreed > a.panelSize || uint256(a.issuedAt) + ISSUED_AT_TOLERANCE < e.askedAt
                 || a.expiresAt < a.issuedAt || a.answer.length != 32
         ) revert InvalidAttestation();
         _verifyAttestation(a, signature);
@@ -258,7 +267,10 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
         e.pot = pot;
         e.openedAt = block.timestamp;
         // Robinhood is Arbitrum Orbit: the snapshot must use L2 RPC block numbers, not L1 block.number.
-        e.snapshotBlock = snapshotHead();
+        // It closes SNAPSHOT_DEPTH blocks behind the head so the plane never reads a window that is
+        // not yet deep enough; a buyer after the snapshot still gains nothing from this epoch.
+        uint256 head = snapshotHead();
+        e.snapshotBlock = head > SNAPSHOT_DEPTH ? head - SNAPSHOT_DEPTH : 0;
         emit EpochOpened(id, e.snapshotBlock, pot);
     }
 
@@ -322,7 +334,11 @@ contract HolderRewards is VaultLinked, OracleAttestationConsumer, ReentrancyGuar
         );
         q.definitions[2] = OracleQuestion.Definition(
             "holders",
-            "All addresses with positive raw ERC20 balanceOf at the end of the specified L2 block, after exclusions. Discover holders from Transfer logs since token creation, then verify historical balances. No current balances or supply-based denominator."
+            string.concat(
+                "All addresses with positive weight after exclusions. Weight is the raw ERC20 balanceOf at the end of the specified L2 block plus the amount stakeOf(address) returns at that block on the jobs vault ",
+                Strings.toHexString(jobsVault),
+                ". Discover holders from Transfer logs since token creation, then verify historical balances and stakes. No current balances or supply-based denominator."
+            )
         );
         q.definitions[3] = OracleQuestion.Definition(
             "leaves",

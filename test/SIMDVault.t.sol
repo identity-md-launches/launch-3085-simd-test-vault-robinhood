@@ -114,6 +114,35 @@ contract SIMDVaultTest is BaseTest {
         assertFalse(vault.bound());
     }
 
+    function test_bindRejectsLaunchesTheAirdropCouldNeverBind() public {
+        // The previous test launch (3076) and anything older, even with this vault as requester.
+        _position(3076, address(token), Network.IMD, address(vault));
+        vm.prank(Network.DEV);
+        vm.expectRevert(SIMDVault.InvalidLaunch.selector);
+        vault.bindLaunch(3076, address(token));
+        _position(3000, Network.IMD, address(token), address(vault));
+        vm.prank(Network.DEV);
+        vm.expectRevert(SIMDVault.InvalidLaunch.selector);
+        vault.bindLaunch(3000, address(token));
+        // A pool whose other currency is not IMD: a third ERC-20 or native ETH.
+        MockToken other = new MockToken(18);
+        _position(LAUNCH, address(token), address(other), address(vault));
+        vm.prank(Network.DEV);
+        vm.expectRevert(SIMDVault.InvalidPair.selector);
+        vault.bindLaunch(LAUNCH, address(token));
+        _position(LAUNCH, address(0), address(token), address(vault));
+        vm.prank(Network.DEV);
+        vm.expectRevert(SIMDVault.InvalidPair.selector);
+        vault.bindLaunch(LAUNCH, address(token));
+        assertFalse(vault.bound());
+        // The same launch paired with IMD, in either currency order, binds and the airdrop follows.
+        _position(LAUNCH, Network.IMD, address(token), address(vault));
+        _bind();
+        token.mint(address(drop), drop.TOTAL_WEIGHT());
+        drop.bind(LAUNCH);
+        assertEq(drop.token(), address(token));
+    }
+
     function test_distributionRequiresBindingAndAllowsFirstImmediatelyThenExactlySevenDays() public {
         vm.expectRevert(SIMDVault.NotBound.selector);
         vault.distribute();
@@ -152,7 +181,7 @@ contract SIMDVaultTest is BaseTest {
         assertEq(token.balanceOf(address(vault)), 0);
         assertEq(Network.MARKETING.balance - beforeEth, 3 ether);
         assertEq(address(vault).balance, 0);
-        assertEq(rewards.epoch(1).snapshotBlock, block.number);
+        assertEq(rewards.epoch(1).snapshotBlock, vm.getBlockNumber() - rewards.SNAPSHOT_DEPTH());
     }
 
     function test_failedFeeClaimStillSplitsExistingFunds() public {

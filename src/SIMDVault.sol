@@ -35,7 +35,9 @@ contract SIMDVault is ReentrancyGuard {
     error AlreadyBound();
     error NotBound();
     error InvalidRequester();
+    error InvalidLaunch();
     error InvalidToken();
+    error InvalidPair();
     error LaunchMismatch();
     error TooSoon();
     error ActionNotSold();
@@ -74,14 +76,19 @@ contract SIMDVault is ReentrancyGuard {
         emit LaunchRequested(requestId, price);
     }
 
+    /// @dev Accepts only a launch the airdrop can also bind: newer than the previous test launch
+    /// and paired with IMD. Both bindings are one-shot, so a mismatch would strand the remainder.
     function bindLaunch(uint64 launchNumber_, address token_) external onlyDev nonReentrant {
         if (bound) revert AlreadyBound();
         (PoolKey memory key,,, address requester) = IHookFactory(Network.FACTORY).positionOf(launchNumber_);
         if (requester != address(this)) revert InvalidRequester();
+        if (launchNumber_ <= simdAirdrop.MIN_LAUNCH_NUMBER()) revert InvalidLaunch();
         if (
             token_ == address(0) || token_ == Network.IMD || token_.code.length == 0
                 || (token_ != key.currency0 && token_ != key.currency1)
         ) revert InvalidToken();
+        address other = token_ == key.currency0 ? key.currency1 : key.currency0;
+        if (other != Network.IMD) revert InvalidPair();
         if (simdAirdrop.token() != address(0)) {
             if (simdAirdrop.token() != token_ || simdAirdrop.launchNumber() != launchNumber_) {
                 revert LaunchMismatch();

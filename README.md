@@ -31,6 +31,9 @@ forge test --match-contract RobinhoodForkTest --fork-url https://rpc.mainnet.cha
 
 An archive RPC also permits `--fork-block-number`. The run reports its actual fork block.
 Fork changes and impersonated calls exist only in the local simulation; tests never broadcast.
+The HOOK factory's newest launch is still 3076, the previous test launch, which these contracts
+refuse by design, so the flows after binding answer `positionOf(3077)` with `vm.mockCall` using
+the real 3076 pool key; everything else (factory, Intake, IMD, pool token) is the live code.
 See [verification notes](docs/VERIFICATION.md) for results and test scope.
 
 ## Deployment parameters
@@ -69,9 +72,11 @@ any remaining approval. A zero price means the action is unavailable. Prices are
    interpreting JSON. An on-chain revert rolls back the one-shot flag; an off-chain rejection after
    payment does not restore it. The Intake records the vault as payer/requester.
 3. After the pool exists, the dev calls `bindLaunch(uint64 launchNumber, address token)` once.
-   The factory must report this vault as requester, and the token must be a non-IMD ERC-20 currency
-   in that pool. The child tokens become fixed in the same transaction. The token must expose
-   `decimals()` for the jobs threshold.
+   The factory must report this vault as requester, the launch number must exceed 3076 (the
+   previous test launch), the token must be a non-IMD ERC-20 currency in that pool and the pool's
+   other currency must be IMD, so the vault can never bind a launch the airdrop would refuse.
+   The child tokens become fixed in the same transaction. The token must expose `decimals()` for
+   the jobs threshold.
 4. Once the remainder has arrived, anyone calls `simdAirdrop.bind(launchNumber)`. The number must
    exceed 3076; the pair must contain IMD; the requester must be the vault; the vault's own binding
    must match; and the airdrop must already hold at least `TOTAL_WEIGHT` token base units.
@@ -108,11 +113,14 @@ dead address, not a call that reduces ERC-20 `totalSupply`.
 ## Holder epochs and oracle protocol
 
 Only the vault can notify a deposit. The contract measures its unreserved IMD balance rather than
-trusting an amount argument. A deposit opens an epoch with that block's snapshot and a 28-day
-window. Robinhood snapshots use `ArbSys(address(100)).arbBlockNumber()`; ordinary EVM runners
-without that precompile fall back to `block.number`. Live fork tests check the L2 reader. A buyer
-after this snapshot gains no entitlement to this epoch, even if they buy just before claiming.
-Holding before a known snapshot is possible: this is a snapshot system, not a holding-duration rule.
+trusting an amount argument. A deposit opens an epoch with a snapshot block and a 28-day window.
+The snapshot is the L2 block `SNAPSHOT_DEPTH` (8) blocks before the deposit transaction's block:
+the oracle plane refuses an absolute window whose last block is fewer than five deep when it
+reads the ask, and a refused ask would spend the price without an answer. Robinhood snapshots
+use `ArbSys(address(100)).arbBlockNumber()`; ordinary EVM runners without that precompile fall
+back to `block.number`. Live fork tests check the L2 reader. A buyer after this snapshot gains no
+entitlement to this epoch, even if they buy just before claiming. Holding before a known snapshot
+is possible: this is a snapshot system, not a holding-duration rule.
 
 The epoch immediately asks `oracle.request@oracle-1` for the root of **IMD allocations calculated
 pro rata from snapshot token balances**. `claim(epoch, amount, proof)` takes the IMD allocation,
@@ -121,9 +129,10 @@ block, eligible-holder definition, exclusions, exact net allocation budget and t
 `oracleBody(epoch)` exposes the complete canonical JSON. The signed `questionHash` uses the
 supplied IdentityMD `OracleQuestion` implementation.
 
-Eligible weights are end-of-block raw `balanceOf` values. Pools, the PoolManager, factory, all
-four suite contracts, the zero address and dead burn address are excluded. The denominator is
-the sum of eligible balances. Each allocation is `floor(allocationBudget * balance / denominator)`.
+Eligible weights are end-of-block raw `balanceOf` values plus the tokens the wallet has staked in
+JobsVault (`stakeOf(wallet)` at that block), so staking for jobs costs no rewards. Pools, the
+PoolManager, factory, all four suite contracts, the zero address and dead burn address are
+excluded as holders. The denominator is the sum of eligible weights. Each allocation is `floor(allocationBudget * balance / denominator)`.
 Leaves are `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))`; trees use
 OpenZeppelin StandardMerkleTree ordering and sorted-pair hashes. A root with no payable leaves
 is `bytes32(uint256(1))`; its entire pot can eventually roll over.
@@ -142,7 +151,12 @@ not spent; it accumulates with the next vault deposit. Anyone can call `retryOra
 day after an attempt while the epoch remains open and unanswered. This covers transaction
 failure, refusal, disagreement, invalid/lost callbacks and no response. Each successful retry
 spends a new live price from that epoch, reduces its net pot and invalidates the previous request.
-There is no refund of successful Intake payments and no unsigned failure callback needed.
+A retry whose replacement request fails (Intake unavailable, or the pot no longer covers the
+price) changes nothing: the pending request stays the epoch's request, its answer is still
+accepted, and the epoch keeps its pot. The retry delay counts from the last attempt; the answer
+freshness check counts from the last paid request (`askedAt`), so a failed retry does not refuse
+an answer issued before it. There is no refund of successful Intake payments and no unsigned
+failure callback needed.
 
 The swarm must process the absolute deposit block after it is confirmed; the contract does not
 silently substitute an earlier block. If admission races confirmation, the one-day retry keeps
@@ -171,12 +185,18 @@ of open epochs. Direct IMD donations are incorporated with the next vault notifi
 
 ## Jobs and airdrop
 
-JobsVault pays `job.open@job-1` with no callback. Each caller must currently hold at least
-`1_000_000 * 10**token.decimals()` units and wait 24 hours between successful on-chain requests.
-Each request consumes its daily slot even if the swarm later refuses the body. An on-chain revert
-consumes neither payment nor slot. Callers supply the whole body, limited to 16 KiB; they are
-responsible for valid job JSON. This is per-wallet eligibility, not Sybil protection or staking;
-transferring/borrowing tokens between wallets can enable additional jobs.
+JobsVault pays `job.open@job-1` with no callback. A wallet holds launched tokens in the vault with
+`stake(amount)` (after approving the vault) and is eligible while `stakeOf(wallet)` is at least
+`1_000_000 * 10**token.decimals()` units; it may request one job per rolling 24 hours. A spot
+wallet balance does not count: it can be lent within one transaction (a transfer chain or a
+Uniswap v4 flash take), which would let one holding buy one job per hop. The stake that buys a
+job is locked for 24 hours (`lockedUntil`), so one holding buys at most one job per day however
+many wallets it passes through. `unstake(amount)` returns only the caller's own tokens once the
+lock has passed; the vault's IMD leaves only as Intake job payments, so there is still no
+withdraw. Staked tokens are credited to their stakers in the HolderRewards snapshot. Each request
+consumes its daily slot and locks the stake even if the swarm later refuses the body. An
+on-chain revert consumes neither payment, slot nor lock. Callers supply the whole body, limited
+to 16 KiB; they are responsible for valid job JSON.
 
 SimdAirdrop fixes these constants:
 

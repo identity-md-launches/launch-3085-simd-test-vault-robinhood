@@ -1,26 +1,50 @@
 # Verification and review notes
 
-The implementation was checked locally on 2026-11-06. All checks use the repository's pinned
-Solidity 0.8.26 configuration. The required fuzz seed is
-`0x5865f61f0c0b5cd7860b4657c4402e8b18928a84d3873787dba88f874ffd4aea`.
+The implementation was checked locally on 2026-11-06 and re-checked after the 2026-11-07
+revision. All checks use the repository's pinned Solidity 0.8.26 configuration. The required
+fuzz seed is `0x5865f61f0c0b5cd7860b4657c4402e8b18928a84d3873787dba88f874ffd4aea`.
 
 ## Final results
 
 | Check | Result |
 | --- | --- |
 | `forge build --sizes` | Passed |
-| `forge test` with the required seed | 60 passed; the offline fork suite skipped |
+| `forge test` with the required seed | 65 passed; the offline fork suite skipped |
 | `forge fmt --check` | Passed |
-| Live `RobinhoodForkTest` | 5 passed at L2 block **107926631**, chain 4663 |
+| Live `RobinhoodForkTest` | 7 passed at L2 block **107987829**, chain 4663 |
 | `python3 -m unittest discover -s test -p 'test_*.py'` | 5 passed |
 | Deployment bytecode inspection | All four application runtimes below EIP-170; initcode below EIP-3860; no library link placeholders or reachable forbidden escape opcodes |
 
 | Application | Runtime bytes | Initcode bytes |
 | --- | ---: | ---: |
-| SIMDVault | 5,557 | 29,365 |
-| HolderRewards | 15,904 | 17,340 |
-| JobsVault | 2,514 | 2,703 |
+| SIMDVault | 5,736 | 30,779 |
+| HolderRewards | 16,300 | 17,736 |
+| JobsVault | 3,353 | 3,542 |
 | SimdAirdrop | 3,218 | 3,408 |
+
+## Revision of 2026-11-07
+
+Three reviewer findings reproduced with the supplied proofs and were fixed; one advisory finding
+was judged real and fixed. The proofs pass on the revised code.
+
+1. `retryOracle` no longer discards a pending request before a replacement is bought. The
+   previous id is deleted inside `submitOracle` only after the new `request()` has returned, so
+   an Intake outage or a pot at the price boundary leaves the pending request live and its answer
+   accepted. A new `askedAt` field (time of the last paid request) drives the answer freshness
+   check, so a failed retry cannot refuse an answer issued before it.
+2. The epoch snapshot is `snapshotHead() - 8` (`SNAPSHOT_DEPTH`) rather than the asking block,
+   so the oracle plane never reads a window that is not yet five blocks deep.
+3. JobsVault eligibility is a stake held in the vault, locked for the job interval by each job,
+   instead of a spot `balanceOf`. One holding passed through ten wallets in one transaction buys
+   one job, not ten. Staked tokens are credited to their stakers in the HolderRewards question.
+4. `bindLaunch` refuses launches at or below 3076 and pools not paired with IMD, the two cases
+   the airdrop's own `bind` would refuse for good after the vault's one-shot binding.
+
+Tests added: failed retry keeps the pending request and its answer pays; price-boundary retry
+keeps the last bought request and the next deposit does not carry the pot away; window depth;
+stake/lock/unstake boundaries; the ten-hop attack; bindLaunch guards; fork binding of a mocked
+3077 position with the real 3076 pool key, real `claimFees`, real oracle payment with the deeper
+window, real-token staking and airdrop binding.
 
 ## Behavioral coverage
 
@@ -30,7 +54,8 @@ Solidity 0.8.26 configuration. The required fuzz seed is
   the exact seven-day boundary, fee-claim reverts/gas exhaustion, complete token burns.
 - Native ETH paid during fee collection; successful payout, rejected payout, gas exhaustion,
   later retry and reentrancy from factory, token, Intake and marketing recipient.
-- Jobs eligibility, six-decimal normalization, independent daily slots, exact daily boundary,
+- Jobs eligibility by stake, six-decimal normalization, independent daily slots, exact daily
+  boundary, the 24-hour stake lock and owner-only unstake, one holding passed through ten wallets,
   changed holdings/prices, invalid body sizes, unavailable action and failed-payment rollback.
 - Measured holder deposits, exact canonical JSON, exclusions and snapshot block, underfunded
   carry, unavailable price/request, one-day retry, retry costs isolated to the correct epoch,
@@ -55,10 +80,14 @@ accounted for as balance/fees/claims, and no approval remains. Handler reverts f
 ## Real-chain evidence
 
 The fork suite uses chain 4663, the real IMD and Intake v2 and the **HOOK** factory. It exercises
-the historical 3076 pool only as an integration fixture. Its requester is changed by impersonation
-on the isolated fork, then the real factory's `claimFees` runs successfully. No protocol code is
-mocked in this suite. Other tests verify real launch payment/payer records, oracle payment/callback
-metadata, real-token jobs eligibility and rejection of unrelated/old launches.
+the historical 3076 pool only as an integration fixture: the real factory's `claimFees(3076)` runs
+successfully and pays its recorded requester, and a handover of 3076 to the vault by impersonation
+is still refused as `InvalidLaunch`. Because no launch above 3076 exists on the factory yet, the
+flows after binding answer `positionOf(3077)` through `vm.mockCall` with the real 3076 pool key
+and the vault as requester; no other protocol code is mocked. Other tests verify real launch
+payment/payer records, oracle payment/callback metadata with the eight-block-deep window,
+real-token staking and jobs payment, airdrop binding of the real token and rejection of
+unrelated/old launches.
 
 Source RPC: `https://rpc.mainnet.chain.robinhood.com`. The supplied provider lacks older archival
 state, so successful runs use a fresh fork; no historical replay or state mutation is sent to RPC.
